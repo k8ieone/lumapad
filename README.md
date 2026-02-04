@@ -25,6 +25,7 @@ Optional user service `~/.config/systemd/user/lumapad.service`:
 ```
 [Unit]
 Description=Gamepad ambient lighting
+After=NetworkManager-wait-online.service
 
 [Service]
 ExecStart=/home/user/.local/bin/lumapad
