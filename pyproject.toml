@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = 'lumapad'
+version = '0.0.1'
+description = ''
+readme = 'README.md'
+requires-python = '>=3.8'
+license = {file = 'LICENSE'}
+authors = [
+    {name = 'Kateřina Medvědová'},
+]
+dependencies = [
+    "PyYAML",
+    "paho-mqtt"
+]
+
+[project.scripts]
+lumapad = "lumapad.main:main"
