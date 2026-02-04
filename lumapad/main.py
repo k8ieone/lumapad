@@ -71,7 +71,8 @@ class LEDController(ABC):
         Uses logarithmic scaling for better perceived brightness control.
         """
         # Normalize illuminance to 0-1 range
-        normalized = min(max(illuminance / 65535.0, 0.0), 1.0)
+        # TODO: Make max illuminance configurable
+        normalized = min(max(illuminance / 20.0, 0.0), 1.0)
 
         # Apply logarithmic scaling for better perception
         scaled = (2.718281828 ** (normalized * 2) - 1) / (2.718281828 ** 2 - 1)
@@ -191,6 +192,7 @@ class PS5DualsenseController(LEDController):
 
             logger.info(f"DualSense ({self.device_name}) initial color: RGB{self.initial_color}")
         # 65535
+        # TODO: Make max illuminance configurable
         # Convert illuminance (0-20 lux) to brightness percentage (0.0-1.0)
         brightness_percentage = min(max(illuminance / 20.0, 0.0), 1.0)
 
