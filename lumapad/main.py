@@ -368,7 +368,7 @@ class GamepadLEDService:
 
         except KeyboardInterrupt:
             logger.info("Service interrupted by user")
-            self.stop(1)
+            self.stop(0)
         except Exception as e:
             logger.error(f"Service error: {e}")
             self.stop(1)
@@ -411,8 +411,8 @@ def main():
     )
     service = GamepadLEDService(config)
     service.run()
+    exit(service_code)
 
 
 if __name__ == "__main__":
     main()
-    exit(service_code)
