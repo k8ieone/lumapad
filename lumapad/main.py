@@ -145,6 +145,8 @@ class PS5DualsenseController(LEDController):
         try:
             values = [int(v.strip()) for v in color_str.split()]
             if len(values) == 3:
+                if sum(values) == 0:
+                    return tuple(0, 0, 255)
                 return tuple(values)
         except ValueError:
             logger.error(f"Failed to parse color values: {color_str}")
