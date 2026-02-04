@@ -29,6 +29,8 @@ After=NetworkManager-wait-online.service
 
 [Service]
 ExecStart=/home/user/.local/bin/lumapad
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=default.target
