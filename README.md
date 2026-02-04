@@ -19,3 +19,16 @@ In `/etc/udev/rules.d/40-leds.rules` add:
 SUBSYSTEM=="leds", ACTION=="add", RUN+="/bin/chgrp -R leds /sys%p", RUN+="/bin/chmod -R g=u /sys%p"
 SUBSYSTEM=="leds", ACTION=="change", RUN+="/bin/chgrp -R leds /sys%p", RUN+="/bin/chmod -R g=u /sys%p"
 ```
+
+Optional user service `~/.config/systemd/user/lumapad.service`:
+
+```
+[Unit]
+Description=Gamepad ambient lighting
+
+[Service]
+ExecStart=/home/user/.local/bin/lumapad
+
+[Install]
+WantedBy=default.target
+```

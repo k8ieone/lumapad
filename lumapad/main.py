@@ -61,7 +61,7 @@ class LEDController(ABC):
         pass
 
     @abstractmethod
-    def revert(self) -> bool:
+    def revert(self) -> None:
         """Revert the device to its original state"""
         pass
 
@@ -108,6 +108,9 @@ class XboxOneController(LEDController):
 
     def is_supported(self) -> bool:
         return os.path.exists(self.brightness_path)
+
+    def revert(self) -> None:
+        logger.log("TODO: Implement revert for Xbox controllers")
 
     def set_brightness(self, illuminance: float) -> bool:
         """Set brightness 0-50 for Xbox One controller"""
