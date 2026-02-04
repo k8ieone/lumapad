@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 import paho.mqtt.client as mqtt
 
 logger = logging.getLogger(__name__)
-
+service_code: int = 1
 
 @dataclass
 class Config:
@@ -368,14 +368,17 @@ class GamepadLEDService:
 
         except KeyboardInterrupt:
             logger.info("Service interrupted by user")
+            self.stop(1)
         except Exception as e:
             logger.error(f"Service error: {e}")
-        finally:
+            self.stop(1)
+        else:
             self.stop()
 
-    def stop(self):
+    def stop(self, code: int = 0):
         """Stop the service"""
         logger.info("Stopping Gamepad LED Service")
+        service_code = code
         self.running = False
 
         # Stop MQTT
@@ -412,3 +415,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    exit(service_code)
