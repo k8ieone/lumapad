@@ -127,6 +127,10 @@ class PS5DualsenseController(LEDController):
         super().__init__(device_path)
         self.multi_intensity_path = os.path.join(device_path, "multi_intensity")
         self.initial_color = None  # Cache the current color
+        # Wait a while before messing with the LEDs
+        # the DS5 can freak out if the LEDs are touched by multiple programs
+        logger.debug("Sleeping 3 seconds to prevent breaking the DS5 LEDs")
+        time.sleep(3)
 
     def is_supported(self) -> bool:
         return os.path.exists(self.multi_intensity_path)
