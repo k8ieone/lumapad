@@ -127,10 +127,6 @@ class PS5DualsenseController(LEDController):
         super().__init__(device_path)
         self.multi_intensity_path = os.path.join(device_path, "multi_intensity")
         self.initial_color = None  # Cache the current color
-        # Wait a while before messing with the LEDs
-        # the DS5 can freak out if the LEDs are touched by multiple programs
-        logger.debug("Sleeping 3 seconds to prevent breaking the DS5 LEDs")
-        time.sleep(3)
 
     def is_supported(self) -> bool:
         return os.path.exists(self.multi_intensity_path)
@@ -282,6 +278,10 @@ class GamepadLEDService:
         # PS5 DualSense controller
         if "rgb:indicator" in led_entry.lower():
             logging.debug("Device: {} is a PS5 controller, adding".format(led_entry))
+            # Wait a while before messing with the LEDs
+            # the DS5 can freak out if the LEDs are touched by multiple programs
+            logger.debug("Sleeping 5 seconds to prevent breaking the DS5 LEDs")
+            time.sleep(5)
             return PS5DualsenseController
 
         return None
