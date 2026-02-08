@@ -315,8 +315,6 @@ class GamepadLEDService:
                     if controller.is_supported():
                         self.controllers[led_entry] = controller
                         logger.info(f"Connected: {controller_type.__name__} - {led_entry}")
-                        # Update new controller with current illuminance
-                        controller.set_brightness(self.current_illuminance)
                 except Exception as e:
                     logger.error(f"Failed to initialize controller {led_entry}: {e}")
 
