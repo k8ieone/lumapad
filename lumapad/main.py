@@ -280,8 +280,8 @@ class GamepadLEDService:
             logging.debug("Device: {} is a PS5 controller, adding".format(led_entry))
             # Wait a while before messing with the LEDs
             # the DS5 can freak out if the LEDs are touched by multiple programs
-            logger.debug("Sleeping 5 seconds to prevent breaking the DS5 LEDs")
-            time.sleep(5)
+            logger.debug("Sleeping 15 seconds to prevent breaking the DS5 LEDs")
+            time.sleep(15)
             return PS5DualsenseController
 
         return None
