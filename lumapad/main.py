@@ -150,6 +150,7 @@ class PS5DualsenseController(LEDController):
             values = [int(v.strip()) for v in color_str.split()]
             if len(values) == 3:
                 if sum(values) == 0:
+                    # TODO: Allow configuring custom default color
                     return (0, 0, 255)
                 return tuple(values)
         except ValueError:
