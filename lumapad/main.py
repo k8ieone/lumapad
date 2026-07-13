@@ -20,6 +20,18 @@ import paho.mqtt.client as mqtt
 logger = logging.getLogger(__name__)
 service_code: int = 1
 
+# Custom TRACE level, below DEBUG, for very high-frequency/noisy messages
+# (e.g. periodic controller scans, individual sysfs reads/writes) that would
+# otherwise drown out normal DEBUG output. Use logger.log(TRACE_LEVEL, ...)
+# (or the `trace()` helper below) to emit at this level.
+TRACE_LEVEL = 5
+logging.addLevelName(TRACE_LEVEL, "TRACE")
+logging.TRACE = TRACE_LEVEL  # type: ignore[attr-defined]
+
+
+def trace(message: str, *args, **kwargs) -> None:
+    logger.log(TRACE_LEVEL, message, *args, **kwargs)
+
 @dataclass
 class Config:
     """Service configuration"""
@@ -99,7 +111,7 @@ class LEDController(ABC):
         try:
             with open(path, 'w') as f:
                 f.write(str(value))
-            logger.debug(f"Wrote '{value}' to {path}")
+            trace(f"Wrote '{value}' to {path}")
             return True
         except (IOError, OSError) as e:
             logger.error(f"Failed to write to {path}: {e}")
@@ -110,7 +122,7 @@ class LEDController(ABC):
         try:
             with open(path, 'r') as f:
                 value = f.read().strip()
-            logger.debug(f"Read '{value}' from {path}")
+            trace(f"Read '{value}' from {path}")
             return value
         except (IOError, OSError) as e:
             logger.error(f"Failed to read from {path}: {e}")
@@ -118,7 +130,7 @@ class LEDController(ABC):
 
 
 class XboxOneController(LEDController):
-    """Xbox One controller LED control (xpad driver)"""
+    """Xbox One controller LED control (xone driver)"""
 
     def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
         super().__init__(device_path, max_illuminance_lux)
@@ -262,9 +274,9 @@ class XpadController(LEDController):
     """
 
     POLL_INTERVAL = 1.0        # Seconds between polls for external changes
-    BLINK_INTERVAL = 60.0      # Seconds between heartbeat blinks
+    BLINK_INTERVAL = 10.0      # Seconds between heartbeat blinks
     BLINK_DURATION = 1.0       # Seconds the blink stays "on"
-    REVERT_TIMEOUT = 30.0      # Max seconds to wait for external control to clear on shutdown
+    REVERT_TIMEOUT = 15.0      # Max seconds to wait for external control to clear on shutdown
 
     def __init__(self, device_path: str, dark_threshold_lux: float = 1.0):
         super().__init__(device_path)
@@ -458,24 +470,24 @@ class GamepadLEDService:
         # Xbox 360-style controller (xpad driver) - no real brightness
         # control, so it's managed separately as a heartbeat-blink pad
         if "xpad" in led_entry:
-            logger.debug(f"Device: {led_entry} is an xpad (Xbox 360-style) device, adding")
+            trace(f"Device: {led_entry} is an xpad (Xbox 360-style) device, adding")
             return XpadController
 
         # Xbox One controller
         if "gip" in led_entry:
-            logger.debug(f"Device: {led_entry} is an xone device, adding")
+            trace(f"Device: {led_entry} is an xone device, adding")
             return XboxOneController
 
         # PS5 DualSense controller
         if "rgb:indicator" in led_entry.lower():
-            logger.debug(f"Device: {led_entry} is a PS5 controller, adding")
+            trace(f"Device: {led_entry} is a PS5 controller, adding")
             # Wait a while before messing with the LEDs
             # the DS5 can freak out if the LEDs are touched by multiple programs
             logger.debug("Sleeping 15 seconds to prevent breaking the DS5 LEDs")
             time.sleep(15)
             return PS5DualsenseController
 
-        logger.debug(f"Device: {led_entry} did not match any known controller type, skipping")
+        trace(f"Device: {led_entry} did not match any known controller type, skipping")
         return None
 
     def _scan_controllers(self):
@@ -490,7 +502,7 @@ class GamepadLEDService:
             logger.error(f"Failed to scan LED devices: {e}")
             return
 
-        logger.debug(
+        trace(
             f"Scanning {len(current_devices)} LED device(s), "
             f"{len(self.controllers)} currently managed"
         )
@@ -502,7 +514,7 @@ class GamepadLEDService:
             new_devices = current_devices - existing_devices
             for led_entry in new_devices:
                 led_path = os.path.join(self.config.leds_base_path, led_entry)
-                logger.debug(f"Found new LED device: {led_entry}")
+                trace(f"Found new LED device: {led_entry}")
                 controller_type = self._get_controller_type(led_entry)
 
                 if controller_type is None:
@@ -519,7 +531,7 @@ class GamepadLEDService:
                         self.controllers[led_entry] = controller
                         logger.info(f"Connected: {controller_type.__name__} - {led_entry}")
                     else:
-                        logger.debug(
+                        trace(
                             f"Device: {led_entry} matched {controller_type.__name__} "
                             f"but is not supported (missing expected sysfs attributes), skipping"
                         )
