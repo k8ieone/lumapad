@@ -38,9 +38,11 @@ class Config:
     def from_file(cls, config_path: str = "/etc/gamepad-led-service/config.json") -> 'Config':
         """Load configuration from JSON file"""
         if os.path.exists(config_path):
+            logger.debug(f"Loading config from {config_path}")
             with open(config_path, 'r') as f:
                 data = json.load(f)
                 return cls(**data)
+        logger.debug(f"No config file found at {config_path}, using defaults")
         return cls()
 
 
@@ -97,6 +99,7 @@ class LEDController(ABC):
         try:
             with open(path, 'w') as f:
                 f.write(str(value))
+            logger.debug(f"Wrote '{value}' to {path}")
             return True
         except (IOError, OSError) as e:
             logger.error(f"Failed to write to {path}: {e}")
@@ -106,7 +109,9 @@ class LEDController(ABC):
         """Read value from sysfs file"""
         try:
             with open(path, 'r') as f:
-                return f.read().strip()
+                value = f.read().strip()
+            logger.debug(f"Read '{value}' from {path}")
+            return value
         except (IOError, OSError) as e:
             logger.error(f"Failed to read from {path}: {e}")
             return None
@@ -452,24 +457,25 @@ class GamepadLEDService:
         """Determine controller type from LED entry name"""
         # Xbox 360-style controller (xpad driver) - no real brightness
         # control, so it's managed separately as a heartbeat-blink pad
-        if "xpad" in led_entry and "xbox360" in led_entry.lower():
-            logging.debug("Device: {} is an xpad (Xbox 360-style) device, adding".format(led_entry))
+        if "xpad" in led_entry:
+            logger.debug(f"Device: {led_entry} is an xpad (Xbox 360-style) device, adding")
             return XpadController
 
         # Xbox One controller
         if "gip" in led_entry:
-            logging.debug("Device: {} is an xone device, adding".format(led_entry))
+            logger.debug(f"Device: {led_entry} is an xone device, adding")
             return XboxOneController
 
         # PS5 DualSense controller
         if "rgb:indicator" in led_entry.lower():
-            logging.debug("Device: {} is a PS5 controller, adding".format(led_entry))
+            logger.debug(f"Device: {led_entry} is a PS5 controller, adding")
             # Wait a while before messing with the LEDs
             # the DS5 can freak out if the LEDs are touched by multiple programs
             logger.debug("Sleeping 15 seconds to prevent breaking the DS5 LEDs")
             time.sleep(15)
             return PS5DualsenseController
 
+        logger.debug(f"Device: {led_entry} did not match any known controller type, skipping")
         return None
 
     def _scan_controllers(self):
@@ -484,6 +490,11 @@ class GamepadLEDService:
             logger.error(f"Failed to scan LED devices: {e}")
             return
 
+        logger.debug(
+            f"Scanning {len(current_devices)} LED device(s), "
+            f"{len(self.controllers)} currently managed"
+        )
+
         with self.lock:
             existing_devices = set(self.controllers.keys())
 
@@ -491,6 +502,7 @@ class GamepadLEDService:
             new_devices = current_devices - existing_devices
             for led_entry in new_devices:
                 led_path = os.path.join(self.config.leds_base_path, led_entry)
+                logger.debug(f"Found new LED device: {led_entry}")
                 controller_type = self._get_controller_type(led_entry)
 
                 if controller_type is None:
@@ -506,6 +518,11 @@ class GamepadLEDService:
                         controller.start()
                         self.controllers[led_entry] = controller
                         logger.info(f"Connected: {controller_type.__name__} - {led_entry}")
+                    else:
+                        logger.debug(
+                            f"Device: {led_entry} matched {controller_type.__name__} "
+                            f"but is not supported (missing expected sysfs attributes), skipping"
+                        )
                 except Exception as e:
                     logger.error(f"Failed to initialize controller {led_entry}: {e}")
 
@@ -514,6 +531,7 @@ class GamepadLEDService:
             for led_entry in removed_devices:
                 controller = self.controllers.pop(led_entry)
                 logger.info(f"Disconnected: {controller.__class__.__name__} - {led_entry}")
+                logger.debug(f"Reverting and tearing down {led_entry} after disconnect")
                 try:
                     controller.revert()
                 except Exception as e:
@@ -554,6 +572,10 @@ class GamepadLEDService:
         self.scanner_thread.start()
 
         try:
+            logger.debug(
+                f"Connecting to MQTT broker {self.config.mqtt_broker}:{self.config.mqtt_port} "
+                f"(topic: {self.config.mqtt_topic})"
+            )
             self.mqtt_client.connect(
                 self.config.mqtt_broker,
                 self.config.mqtt_port,
@@ -581,11 +603,13 @@ class GamepadLEDService:
         self.running = False
 
         # Stop MQTT
+        logger.debug("Disconnecting from MQTT broker")
         self.mqtt_client.loop_stop()
         self.mqtt_client.disconnect()
 
         # Wait for scanner thread
         if self.scanner_thread:
+            logger.debug("Waiting for controller scanner thread to stop")
             self.scanner_thread.join(timeout=5)
 
         with self.lock:
@@ -593,6 +617,7 @@ class GamepadLEDService:
             # may block for a while waiting for externally-driven LED state
             # to settle before restoring the original value, and we don't
             # want to wait on each of those sequentially.
+            logger.debug(f"Reverting {len(self.controllers)} controller(s)")
             revert_threads = []
             for controller in self.controllers.values():
                 t = threading.Thread(target=self._safe_revert, args=(controller,), daemon=True)
@@ -610,6 +635,7 @@ class GamepadLEDService:
 
     def _safe_revert(self, controller: LEDController) -> None:
         """Revert a single controller, logging (rather than raising) on failure"""
+        logger.debug(f"Reverting {controller.__class__.__name__} - {controller.device_name}")
         try:
             controller.revert()
         except Exception as e:
