@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import logging
+import signal
 import threading
 import time
 from pathlib import Path
@@ -287,6 +288,10 @@ class XpadController(LEDController):
         self._last_written: Optional[str] = None
         self._external_override = False
         self._current_illuminance = 0.0
+        # We don't know the real illuminance until the first MQTT reading
+        # comes in - until then, assume it's NOT dark so we don't blink
+        # based on the placeholder 0.0 default.
+        self._have_illuminance_reading = False
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -317,6 +322,7 @@ class XpadController(LEDController):
         """
         with self._state_lock:
             self._current_illuminance = illuminance
+            self._have_illuminance_reading = True
         return True
 
     def _write_value(self, value: str) -> bool:
@@ -360,8 +366,12 @@ class XpadController(LEDController):
             if not self._external_override:
                 with self._state_lock:
                     illuminance = self._current_illuminance
+                    have_reading = self._have_illuminance_reading
 
-                is_dark = illuminance < self.dark_threshold_lux
+                # Don't blink until we've received a real illuminance
+                # reading - otherwise we'd treat the 0.0 placeholder value
+                # as "pitch dark" and blink regardless of actual room light.
+                is_dark = have_reading and illuminance < self.dark_threshold_lux
                 now = time.monotonic()
 
                 if is_dark and (now - last_blink) >= self.BLINK_INTERVAL:
@@ -579,6 +589,12 @@ class GamepadLEDService:
         self.running = True
         logger.info("Starting Gamepad LED Service")
 
+        # SIGTERM (sent by e.g. `systemctl stop`/`kill`) terminates the
+        # process immediately by default, bypassing our cleanup entirely -
+        # register a handler so controllers still get reverted on shutdown.
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGHUP, self._handle_signal)
+
         # Start controller scanner thread
         self.scanner_thread = threading.Thread(target=self._scanner_loop, daemon=False)
         self.scanner_thread.start()
@@ -607,6 +623,11 @@ class GamepadLEDService:
             self.stop(1)
         else:
             self.stop()
+
+    def _handle_signal(self, signum, frame) -> None:
+        """Handle SIGTERM/SIGHUP by requesting a graceful shutdown"""
+        logger.info(f"Received signal {signal.Signals(signum).name}, shutting down")
+        self.running = False
 
     def stop(self, code: int = 0):
         """Stop the service"""
