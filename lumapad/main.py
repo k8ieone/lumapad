@@ -305,12 +305,20 @@ class XpadController(LEDController):
     BLINK_DURATION = 0.2       # Seconds the blink stays "on"
     REVERT_TIMEOUT = 15.0      # Max seconds to wait for external control to clear on shutdown
 
+    # xpad LED codes 2-5 are "blink N times, then go solid on player slot N"
+    # while 6-9 are the solid-only equivalents for the same player slots. We
+    # write the +4 "solid" codes whenever we restore/blink the LED ourselves
+    # so we don't replay the flash animation every time.
+    SOLID_OFFSET = 4
+    BLINKING_CODES = {"2", "3", "4", "5"}
+
     def __init__(self, device_path: str, dark_threshold_lux: float = 1.0):
         super().__init__(device_path)
         self.brightness_path = os.path.join(device_path, "brightness")
         self.dark_threshold_lux = dark_threshold_lux
 
         self.initial_brightness: Optional[str] = None
+        self._solid_brightness: Optional[str] = None
         self._last_written: Optional[str] = None
         self._external_override = False
         self._current_illuminance = 0.0
@@ -341,8 +349,12 @@ class XpadController(LEDController):
             return
 
         self.initial_brightness = current
+        self._solid_brightness = self._to_solid_code(current)
         self._last_written = current
-        logger.info(f"Xpad ({self.device_name}) initial LED state: {self.initial_brightness}")
+        logger.info(
+            f"Xpad ({self.device_name}) initial LED state: {self.initial_brightness} "
+            f"(using solid code {self._solid_brightness} for heartbeat)"
+        )
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -357,6 +369,17 @@ class XpadController(LEDController):
             self._current_illuminance = illuminance
             self._have_illuminance_reading = True
         return True
+
+    def _to_solid_code(self, value: str) -> str:
+        """
+        Map a blink-then-solid player-slot code (2-5) to its solid-only
+        equivalent (6-9) so restoring it doesn't replay the flash animation.
+        Any other code (e.g. "0"/off, or an already-solid 6-9) is returned
+        unchanged.
+        """
+        if value in self.BLINKING_CODES:
+            return str(int(value) + self.SOLID_OFFSET)
+        return value
 
     def _write_value(self, value: str) -> bool:
         ok = self._write_sysfs(self.brightness_path, value)
@@ -391,7 +414,7 @@ class XpadController(LEDController):
         Yields control whenever something else drives the LED.
         """
         logger.debug(f"Starting Xpad heartbeat thread for {self.device_name}")
-        if self.initial_brightness is None:
+        if self.initial_brightness is None or self._solid_brightness is None:
             return
         last_blink = 0.0
         dark_mode_active = False  # whether we've dimmed the LED for "dark"
@@ -413,8 +436,8 @@ class XpadController(LEDController):
 
                 if not is_dark:
                     # Bright enough - just show the pad's normal LED state
-                    if dark_mode_active or self._last_written != self.initial_brightness:
-                        self._write_value(self.initial_brightness)
+                    if dark_mode_active or self._last_written != self._solid_brightness:
+                        self._write_value(self._solid_brightness)
                     dark_mode_active = False
                 elif not dark_mode_active:
                     # Just went dark - turn the LED off and start the
@@ -424,7 +447,7 @@ class XpadController(LEDController):
                     last_blink = now
                 elif (now - last_blink) >= self.BLINK_INTERVAL:
                     logger.debug(f"Blinking Xpad ({self.device_name})")
-                    self._write_value(self.initial_brightness)
+                    self._write_value(self._solid_brightness)
                     self._stop_event.wait(self.BLINK_DURATION)
 
                     # Recheck: don't stomp on an external change that may
