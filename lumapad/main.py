@@ -254,6 +254,70 @@ class PS5DualsenseController(LEDController):
         return self._write_sysfs(self.multi_intensity_path, color_str)
 
 
+class PS5DualsensePlayerLEDController(LEDController):
+    """
+    PS5 DualSense player-indicator LED brightness control.
+
+    The DualSense exposes 5 separate LED class devices (one per player
+    slot), each with its own `brightness`/`max_brightness` sysfs pair.
+    Only the LEDs that are part of the controller's current player-number
+    pattern are lit (non-zero); the rest are already off (0) and should
+    stay that way. Each entry is otherwise controlled completely
+    independently of the others.
+    """
+
+    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
+        super().__init__(device_path, max_illuminance_lux)
+        self.brightness_path = os.path.join(device_path, "brightness")
+        self.max_brightness_path = os.path.join(device_path, "max_brightness")
+        self.initial_brightness = None  # Cache the current brightness
+        self.max_brightness = None  # Cache the device's max_brightness (typically 3)
+
+    def is_supported(self) -> bool:
+        return os.path.exists(self.brightness_path) and os.path.exists(self.max_brightness_path)
+
+    def revert(self) -> None:
+        if self.initial_brightness is None:
+            logger.warning(f"No initial brightness recorded for {self.device_name}, skipping revert")
+            return
+        logger.info(f"Setting DualSense player LED ({self.device_name}) brightness back to {self.initial_brightness}")
+        self._write_sysfs(self.brightness_path, self.initial_brightness)
+
+    def set_brightness(self, illuminance: float) -> bool:
+        """
+        Set brightness for a single player-indicator LED segment.
+
+        Only LEDs that were initially lit (part of the active
+        player-number pattern) are adjusted; LEDs that started off are
+        left alone so we don't spuriously light up the wrong pattern.
+        """
+        if self.initial_brightness is None:
+            current = self._read_sysfs(self.brightness_path)
+            if current is None:
+                logger.warning(f"Could not read initial brightness for {self.device_name}")
+                return False
+            self.initial_brightness = int(current)
+
+            max_brightness_str = self._read_sysfs(self.max_brightness_path)
+            self.max_brightness = int(max_brightness_str) if max_brightness_str else 3
+
+            logger.info(
+                f"DualSense player LED ({self.device_name}) initial brightness: "
+                f"{self.initial_brightness}/{self.max_brightness}"
+            )
+
+        if self.initial_brightness == 0:
+            # Not part of the active player-number pattern, leave it off.
+            return True
+
+        # Only a handful of discrete levels are available (typically
+        # 0-3), so never dim an active segment all the way to off - keep
+        # it within 1..max_brightness.
+        brightness = self._calculate_brightness(illuminance, 1, self.max_brightness)
+        logger.debug(f"Setting DualSense player LED ({self.device_name}) brightness to {brightness}")
+        return self._write_sysfs(self.brightness_path, brightness)
+
+
 class XpadController(LEDController):
     """
     Xbox 360-style controller LED control (xpad driver).
@@ -497,8 +561,30 @@ class GamepadLEDService:
         if reason_code != 0:
             logger.warning(f"Unexpected MQTT disconnection with code {reason_code}")
 
-    def _get_controller_type(self, led_entry: str) -> Optional[type]:
-        """Determine controller type from LED entry name"""
+    def _get_driver_module(self, led_path: str) -> Optional[str]:
+        """
+        Resolve the kernel driver module backing a LED sysfs entry, by
+        following device -> driver -> module symlinks, e.g.:
+
+          /sys/class/leds/<entry>/device/driver/module -> ../../../module/hid_playstation
+
+        Returns the module name (e.g. "hid_playstation") or None if it
+        can't be determined (missing symlinks, permissions, etc).
+        """
+        module_path = os.path.join(led_path, "device", "driver", "module")
+        try:
+            resolved = os.path.realpath(module_path)
+        except OSError as e:
+            trace(f"Failed to resolve driver module for {led_path}: {e}")
+            return None
+
+        if not os.path.exists(resolved):
+            return None
+
+        return os.path.basename(resolved)
+
+    def _get_controller_type(self, led_entry: str, led_path: str) -> Optional[type]:
+        """Determine controller type from LED entry name and backing driver module"""
         # Xbox 360-style controller (xpad driver) - no real brightness
         # control, so it's managed separately as a heartbeat-blink pad
         if "xpad" in led_entry:
@@ -510,14 +596,28 @@ class GamepadLEDService:
             trace(f"Device: {led_entry} is an xone device, adding")
             return XboxOneController
 
-        # PS5 DualSense controller
-        if "rgb:indicator" in led_entry.lower():
-            trace(f"Device: {led_entry} is a PS5 controller, adding")
-            # Wait a while before messing with the LEDs
-            # the DS5 can freak out if the LEDs are touched by multiple programs
-            logger.debug("Sleeping 15 seconds to prevent breaking the DS5 LEDs")
-            time.sleep(15)
-            return PS5DualsenseController
+        # PS5 DualSense controller - verify the driver module to avoid
+        # false-positive matches on unrelated LED devices that happen to
+        # share the same naming convention
+        if "rgb:indicator" in led_entry.lower() or "white:player-" in led_entry.lower():
+            driver_module = self._get_driver_module(led_path)
+            if driver_module != "hid_playstation":
+                trace(
+                    f"Device: {led_entry} looks like a DualSense LED but is backed by "
+                    f"driver module '{driver_module}', not 'hid_playstation', skipping"
+                )
+                return None
+
+            if "rgb:indicator" in led_entry.lower():
+                trace(f"Device: {led_entry} is a PS5 controller, adding")
+                # Wait a while before messing with the LEDs
+                # the DS5 can freak out if the LEDs are touched by multiple programs
+                logger.debug("Sleeping 15 seconds to prevent breaking the DS5 LEDs")
+                time.sleep(15)
+                return PS5DualsenseController
+
+            trace(f"Device: {led_entry} is a PS5 controller player LED, adding")
+            return PS5DualsensePlayerLEDController
 
         trace(f"Device: {led_entry} did not match any known controller type, skipping")
         return None
@@ -547,7 +647,7 @@ class GamepadLEDService:
             for led_entry in new_devices:
                 led_path = os.path.join(self.config.leds_base_path, led_entry)
                 trace(f"Found new LED device: {led_entry}")
-                controller_type = self._get_controller_type(led_entry)
+                controller_type = self._get_controller_type(led_entry, led_path)
 
                 if controller_type is None:
                     continue
