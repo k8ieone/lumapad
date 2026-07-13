@@ -106,15 +106,29 @@ class XboxOneController(LEDController):
     def __init__(self, device_path: str):
         super().__init__(device_path)
         self.brightness_path = os.path.join(device_path, "brightness")
+        self.initial_brightness = None  # Cache the current brightness
 
     def is_supported(self) -> bool:
         return os.path.exists(self.brightness_path)
 
     def revert(self) -> None:
-        logger.log("TODO: Implement revert for Xbox controllers")
+        if self.initial_brightness is None:
+            logger.warning(f"No initial brightness recorded for {self.device_name}, skipping revert")
+            return
+        logger.info(f"Setting Xbox One ({self.device_name}) brightness back to {self.initial_brightness}")
+        self._write_sysfs(self.brightness_path, self.initial_brightness)
 
     def set_brightness(self, illuminance: float) -> bool:
         """Set brightness 0-50 for Xbox One controller"""
+        # Read current brightness if we haven't cached it yet
+        if self.initial_brightness is None:
+            current = self._read_sysfs(self.brightness_path)
+            if current is None:
+                logger.warning(f"Could not read initial brightness for {self.device_name}")
+                return False
+            self.initial_brightness = current
+            logger.info(f"Xbox One ({self.device_name}) initial brightness: {self.initial_brightness}")
+
         brightness = self._calculate_brightness(illuminance, 1, 50)
         logger.debug(f"Setting Xbox One ({self.device_name}) brightness to {brightness}")
         return self._write_sysfs(self.brightness_path, brightness)
