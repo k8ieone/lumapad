@@ -11,10 +11,11 @@ import logging
 import signal
 import threading
 import time
+import functools
 from pathlib import Path
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -129,37 +130,63 @@ class LEDController(ABC):
             return None
 
 
-class XboxOneController(LEDController):
-    """Xbox One controller LED control (xone driver)"""
+class BrightnessLEDController(LEDController):
+    """
+    Generic single-attribute brightness LED control, for devices that
+    expose a plain `brightness`/`max_brightness` sysfs pair (as opposed to
+    e.g. a multi-color `multi_intensity` attribute). Used for both the
+    Xbox One controller (xone driver) and the DualSense player-indicator
+    LEDs - they only differ in how many brightness levels are available,
+    which is read dynamically from `max_brightness` rather than assumed.
+    """
 
-    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
+    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0, label: str = "LED"):
         super().__init__(device_path, max_illuminance_lux)
+        self.label = label
         self.brightness_path = os.path.join(device_path, "brightness")
+        self.max_brightness_path = os.path.join(device_path, "max_brightness")
         self.initial_brightness = None  # Cache the current brightness
+        self.max_brightness = None  # Cache the device's max_brightness
 
     def is_supported(self) -> bool:
-        return os.path.exists(self.brightness_path)
+        return os.path.exists(self.brightness_path) and os.path.exists(self.max_brightness_path)
 
     def revert(self) -> None:
         if self.initial_brightness is None:
             logger.warning(f"No initial brightness recorded for {self.device_name}, skipping revert")
             return
-        logger.info(f"Setting Xbox One ({self.device_name}) brightness back to {self.initial_brightness}")
+        logger.info(f"Setting {self.label} ({self.device_name}) brightness back to {self.initial_brightness}")
         self._write_sysfs(self.brightness_path, self.initial_brightness)
 
     def set_brightness(self, illuminance: float) -> bool:
-        """Set brightness 0-50 for Xbox One controller"""
-        # Read current brightness if we haven't cached it yet
+        """Set brightness, scaled from 1 up to the device's own max_brightness"""
+        # Read current brightness/max_brightness if we haven't cached them yet
         if self.initial_brightness is None:
             current = self._read_sysfs(self.brightness_path)
             if current is None:
                 logger.warning(f"Could not read initial brightness for {self.device_name}")
                 return False
-            self.initial_brightness = current
-            logger.info(f"Xbox One ({self.device_name}) initial brightness: {self.initial_brightness}")
+            self.initial_brightness = int(current)
 
-        brightness = self._calculate_brightness(illuminance, 1, 50)
-        logger.debug(f"Setting Xbox One ({self.device_name}) brightness to {brightness}")
+            max_brightness_str = self._read_sysfs(self.max_brightness_path)
+            if max_brightness_str is None:
+                logger.warning(f"Could not read max_brightness for {self.device_name}")
+                return False
+            self.max_brightness = int(max_brightness_str)
+
+            logger.info(
+                f"{self.label} ({self.device_name}) initial brightness: "
+                f"{self.initial_brightness}/{self.max_brightness}"
+            )
+
+        if self.initial_brightness == 0:
+            # LED started off (e.g. not part of the DualSense's active
+            # player-number pattern) - leave it alone rather than
+            # spuriously lighting it up.
+            return True
+
+        brightness = self._calculate_brightness(illuminance, 1, self.max_brightness)
+        logger.debug(f"Setting {self.label} ({self.device_name}) brightness to {brightness}")
         return self._write_sysfs(self.brightness_path, brightness)
 
 
@@ -252,70 +279,6 @@ class PS5DualsenseController(LEDController):
         logger.debug(f"Setting DualSense ({self.device_name}) to RGB{scaled_color} (illuminance: {illuminance})")
 
         return self._write_sysfs(self.multi_intensity_path, color_str)
-
-
-class PS5DualsensePlayerLEDController(LEDController):
-    """
-    PS5 DualSense player-indicator LED brightness control.
-
-    The DualSense exposes 5 separate LED class devices (one per player
-    slot), each with its own `brightness`/`max_brightness` sysfs pair.
-    Only the LEDs that are part of the controller's current player-number
-    pattern are lit (non-zero); the rest are already off (0) and should
-    stay that way. Each entry is otherwise controlled completely
-    independently of the others.
-    """
-
-    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
-        super().__init__(device_path, max_illuminance_lux)
-        self.brightness_path = os.path.join(device_path, "brightness")
-        self.max_brightness_path = os.path.join(device_path, "max_brightness")
-        self.initial_brightness = None  # Cache the current brightness
-        self.max_brightness = None  # Cache the device's max_brightness (typically 3)
-
-    def is_supported(self) -> bool:
-        return os.path.exists(self.brightness_path) and os.path.exists(self.max_brightness_path)
-
-    def revert(self) -> None:
-        if self.initial_brightness is None:
-            logger.warning(f"No initial brightness recorded for {self.device_name}, skipping revert")
-            return
-        logger.info(f"Setting DualSense player LED ({self.device_name}) brightness back to {self.initial_brightness}")
-        self._write_sysfs(self.brightness_path, self.initial_brightness)
-
-    def set_brightness(self, illuminance: float) -> bool:
-        """
-        Set brightness for a single player-indicator LED segment.
-
-        Only LEDs that were initially lit (part of the active
-        player-number pattern) are adjusted; LEDs that started off are
-        left alone so we don't spuriously light up the wrong pattern.
-        """
-        if self.initial_brightness is None:
-            current = self._read_sysfs(self.brightness_path)
-            if current is None:
-                logger.warning(f"Could not read initial brightness for {self.device_name}")
-                return False
-            self.initial_brightness = int(current)
-
-            max_brightness_str = self._read_sysfs(self.max_brightness_path)
-            self.max_brightness = int(max_brightness_str) if max_brightness_str else 3
-
-            logger.info(
-                f"DualSense player LED ({self.device_name}) initial brightness: "
-                f"{self.initial_brightness}/{self.max_brightness}"
-            )
-
-        if self.initial_brightness == 0:
-            # Not part of the active player-number pattern, leave it off.
-            return True
-
-        # Only a handful of discrete levels are available (typically
-        # 0-3), so never dim an active segment all the way to off - keep
-        # it within 1..max_brightness.
-        brightness = self._calculate_brightness(illuminance, 1, self.max_brightness)
-        logger.debug(f"Setting DualSense player LED ({self.device_name}) brightness to {brightness}")
-        return self._write_sysfs(self.brightness_path, brightness)
 
 
 class XpadController(LEDController):
@@ -583,18 +546,22 @@ class GamepadLEDService:
 
         return os.path.basename(resolved)
 
-    def _get_controller_type(self, led_entry: str, led_path: str) -> Optional[type]:
-        """Determine controller type from LED entry name and backing driver module"""
+    def _get_controller_type(self, led_entry: str, led_path: str) -> Optional[Callable[..., LEDController]]:
+        """
+        Determine controller factory from LED entry name and backing driver
+        module. Returns a callable taking (device_path, max_illuminance_lux)
+        and producing a LEDController, or None if unsupported.
+        """
         # Xbox 360-style controller (xpad driver) - no real brightness
         # control, so it's managed separately as a heartbeat-blink pad
         if "xpad" in led_entry:
             trace(f"Device: {led_entry} is an xpad (Xbox 360-style) device, adding")
             return XpadController
 
-        # Xbox One controller
+        # Xbox One controller - plain brightness/max_brightness LED
         if "gip" in led_entry:
             trace(f"Device: {led_entry} is an xone device, adding")
-            return XboxOneController
+            return functools.partial(BrightnessLEDController, label="Xbox One")
 
         # PS5 DualSense controller - verify the driver module to avoid
         # false-positive matches on unrelated LED devices that happen to
@@ -616,8 +583,11 @@ class GamepadLEDService:
                 time.sleep(15)
                 return PS5DualsenseController
 
+            # Player-indicator LEDs - same plain brightness/max_brightness
+            # attributes as the Xbox One controller, just with a different
+            # (device-reported) number of levels.
             trace(f"Device: {led_entry} is a PS5 controller player LED, adding")
-            return PS5DualsensePlayerLEDController
+            return functools.partial(BrightnessLEDController, label="DualSense player LED")
 
         trace(f"Device: {led_entry} did not match any known controller type, skipping")
         return None
@@ -661,10 +631,10 @@ class GamepadLEDService:
                     if controller.is_supported():
                         controller.start()
                         self.controllers[led_entry] = controller
-                        logger.info(f"Connected: {controller_type.__name__} - {led_entry}")
+                        logger.info(f"Connected: {controller.__class__.__name__} - {led_entry}")
                     else:
                         trace(
-                            f"Device: {led_entry} matched {controller_type.__name__} "
+                            f"Device: {led_entry} matched {controller.__class__.__name__} "
                             f"but is not supported (missing expected sysfs attributes), skipping"
                         )
                 except Exception as e:
