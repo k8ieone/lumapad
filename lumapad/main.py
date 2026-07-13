@@ -31,6 +31,8 @@ class Config:
     leds_base_path: str = "/sys/class/leds"
     controller_scan_interval: int = 5  # Seconds between scans for new controllers
     log_level: str = "INFO"
+    xpad_dark_threshold_lux: float = 1.0  # Below this, xpad heartbeat blink is enabled
+    max_illuminance_lux: float = 20.0  # Illuminance at/above which brightness is maxed out
 
     @classmethod
     def from_file(cls, config_path: str = "/etc/gamepad-led-service/config.json") -> 'Config':
@@ -45,10 +47,11 @@ class Config:
 class LEDController(ABC):
     """Abstract base class for gamepad LED controllers"""
 
-    def __init__(self, device_path: str):
+    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
         self.device_path = device_path
         self.device_name = Path(device_path).name
         self.last_update = 0
+        self.max_illuminance_lux = max_illuminance_lux
 
     @abstractmethod
     def set_brightness(self, illuminance: float) -> bool:
@@ -65,14 +68,23 @@ class LEDController(ABC):
         """Revert the device to its original state"""
         pass
 
+    def start(self) -> None:
+        """
+        Optional hook called once the controller has been confirmed
+        supported and registered. Default no-op; controllers that need
+        background management (e.g. a heartbeat blink thread) can
+        override this.
+        """
+        pass
+
     def _calculate_brightness(self, illuminance: float, min_val: int, max_val: int) -> int:
         """
-        Convert illuminance (0-65535 lux typically) to brightness value.
-        Uses logarithmic scaling for better perceived brightness control.
+        Convert illuminance (0 to max_illuminance_lux, typically 0-65535 lux)
+        to brightness value. Uses logarithmic scaling for better perceived
+        brightness control.
         """
         # Normalize illuminance to 0-1 range
-        # TODO: Make max illuminance configurable
-        normalized = min(max(illuminance / 20.0, 0.0), 1.0)
+        normalized = min(max(illuminance / self.max_illuminance_lux, 0.0), 1.0)
 
         # Apply logarithmic scaling for better perception
         scaled = (2.718281828 ** (normalized * 2) - 1) / (2.718281828 ** 2 - 1)
@@ -103,8 +115,8 @@ class LEDController(ABC):
 class XboxOneController(LEDController):
     """Xbox One controller LED control (xpad driver)"""
 
-    def __init__(self, device_path: str):
-        super().__init__(device_path)
+    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
+        super().__init__(device_path, max_illuminance_lux)
         self.brightness_path = os.path.join(device_path, "brightness")
         self.initial_brightness = None  # Cache the current brightness
 
@@ -137,8 +149,8 @@ class XboxOneController(LEDController):
 class PS5DualsenseController(LEDController):
     """PS5 DualSense controller RGB LED control"""
 
-    def __init__(self, device_path: str):
-        super().__init__(device_path)
+    def __init__(self, device_path: str, max_illuminance_lux: float = 20.0):
+        super().__init__(device_path, max_illuminance_lux)
         self.multi_intensity_path = os.path.join(device_path, "multi_intensity")
         self.initial_color = None  # Cache the current color
 
@@ -208,10 +220,9 @@ class PS5DualsenseController(LEDController):
                 return False
 
             logger.info(f"DualSense ({self.device_name}) initial color: RGB{self.initial_color}")
-        # 65535
-        # TODO: Make max illuminance configurable
-        # Convert illuminance (0-20 lux) to brightness percentage (0.0-1.0)
-        brightness_percentage = min(max(illuminance / 20.0, 0.0), 1.0)
+
+        # Convert illuminance (0 to max_illuminance_lux) to brightness percentage (0.0-1.0)
+        brightness_percentage = min(max(illuminance / self.max_illuminance_lux, 0.0), 1.0)
 
         # Apply logarithmic scaling for better perceived brightness control
         brightness_percentage = (2.718281828 ** (brightness_percentage * 2) - 1) / (2.718281828 ** 2 - 1)
@@ -224,6 +235,166 @@ class PS5DualsenseController(LEDController):
         logger.debug(f"Setting DualSense ({self.device_name}) to RGB{scaled_color} (illuminance: {illuminance})")
 
         return self._write_sysfs(self.multi_intensity_path, color_str)
+
+
+class XpadController(LEDController):
+    """
+    Xbox 360-style controller LED control (xpad driver).
+
+    The xpad "brightness" attribute is not a real brightness dial - it's an
+    LED effect/mode selector (off, player-N solid, blink patterns, rotate,
+    etc). There's no way to dim these LEDs, so instead of mapping illuminance
+    to brightness we blink the LED briefly once in a while as a "still alive"
+    heartbeat when the room is dark, and otherwise leave it alone.
+
+    The driver/hardware can also drive this attribute on its own (there's no
+    reliable way to distinguish this from another process writing to it, and
+    sysfs doesn't notify us about it either way) - most notably, we don't
+    want to fight the pad's player-slot indicator. We poll the attribute to
+    detect when its value no longer matches what we last wrote, and back off
+    until it settles back to the value we captured when we started managing
+    the pad.
+    """
+
+    POLL_INTERVAL = 1.0        # Seconds between polls for external changes
+    BLINK_INTERVAL = 60.0      # Seconds between heartbeat blinks
+    BLINK_DURATION = 1.0       # Seconds the blink stays "on"
+    REVERT_TIMEOUT = 30.0      # Max seconds to wait for external control to clear on shutdown
+
+    def __init__(self, device_path: str, dark_threshold_lux: float = 1.0):
+        super().__init__(device_path)
+        self.brightness_path = os.path.join(device_path, "brightness")
+        self.dark_threshold_lux = dark_threshold_lux
+
+        self.initial_brightness: Optional[str] = None
+        self._last_written: Optional[str] = None
+        self._external_override = False
+        self._current_illuminance = 0.0
+
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._state_lock = threading.RLock()
+
+    def is_supported(self) -> bool:
+        return os.path.exists(self.brightness_path)
+
+    def start(self) -> None:
+        """Capture the pad's current LED state and start the heartbeat thread"""
+        current = self._read_sysfs(self.brightness_path)
+        if current is None:
+            logger.warning(f"Could not read initial LED state for {self.device_name}")
+            return
+
+        self.initial_brightness = current
+        self._last_written = current
+        logger.info(f"Xpad ({self.device_name}) initial LED state: {self.initial_brightness}")
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_brightness(self, illuminance: float) -> bool:
+        """
+        Xpad doesn't support real brightness control - just record the
+        illuminance so the heartbeat thread can decide whether it's dark
+        enough to blink.
+        """
+        with self._state_lock:
+            self._current_illuminance = illuminance
+        return True
+
+    def _write_value(self, value: str) -> bool:
+        ok = self._write_sysfs(self.brightness_path, value)
+        if ok:
+            self._last_written = value
+        return ok
+
+    def _check_external_override(self) -> None:
+        """Detect whether something outside of us changed the LED state"""
+        current = self._read_sysfs(self.brightness_path)
+        if current is None:
+            return
+
+        if self._external_override:
+            if current == self.initial_brightness:
+                logger.info(f"Xpad ({self.device_name}) LED returned to baseline, resuming control")
+                self._external_override = False
+                self._last_written = current
+        elif self._last_written is not None and current != self._last_written:
+            logger.info(
+                f"Xpad ({self.device_name}) LED changed externally "
+                f"({self._last_written} -> {current}), yielding control"
+            )
+            self._external_override = True
+            self._last_written = current
+
+    def _run(self) -> None:
+        """
+        Background heartbeat loop: blink once a minute in the dark, while
+        yielding control whenever something else drives the LED.
+        """
+        logger.debug(f"Starting Xpad heartbeat thread for {self.device_name}")
+        if self.initial_brightness is None:
+            return
+        last_blink = 0.0
+
+        while not self._stop_event.is_set():
+            self._check_external_override()
+
+            if not self._external_override:
+                with self._state_lock:
+                    illuminance = self._current_illuminance
+
+                is_dark = illuminance < self.dark_threshold_lux
+                now = time.monotonic()
+
+                if is_dark and (now - last_blink) >= self.BLINK_INTERVAL:
+                    logger.debug(f"Blinking Xpad ({self.device_name})")
+                    self._write_value(self.initial_brightness)
+                    self._stop_event.wait(self.BLINK_DURATION)
+
+                    # Recheck: don't stomp on an external change that may
+                    # have happened while the blink was on
+                    self._check_external_override()
+                    if not self._external_override:
+                        self._write_value("0")
+
+                    last_blink = now
+
+            self._stop_event.wait(self.POLL_INTERVAL)
+
+        logger.debug(f"Stopping Xpad heartbeat thread for {self.device_name}")
+
+    def revert(self) -> None:
+        """
+        Restore the pad's original LED state, waiting (up to a timeout) for
+        any externally-driven state to settle back to baseline first.
+        """
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=self.POLL_INTERVAL * 2)
+
+        if self.initial_brightness is None:
+            return
+
+        if self._external_override:
+            logger.info(
+                f"Xpad ({self.device_name}) LED is externally controlled, "
+                f"waiting up to {self.REVERT_TIMEOUT:.0f}s for it to settle"
+            )
+            deadline = time.monotonic() + self.REVERT_TIMEOUT
+            while time.monotonic() < deadline:
+                current = self._read_sysfs(self.brightness_path)
+                if current == self.initial_brightness:
+                    self._external_override = False
+                    break
+                time.sleep(self.POLL_INTERVAL)
+            else:
+                logger.warning(
+                    f"Timed out waiting for Xpad ({self.device_name}) LED to settle; reverting anyway"
+                )
+
+        logger.info(f"Setting Xpad ({self.device_name}) brightness back to {self.initial_brightness}")
+        self._write_sysfs(self.brightness_path, self.initial_brightness)
 
 
 class GamepadLEDService:
@@ -279,10 +450,11 @@ class GamepadLEDService:
 
     def _get_controller_type(self, led_entry: str) -> Optional[type]:
         """Determine controller type from LED entry name"""
-        # Skip Xbox 360 controllers
+        # Xbox 360-style controller (xpad driver) - no real brightness
+        # control, so it's managed separately as a heartbeat-blink pad
         if "xpad" in led_entry and "xbox360" in led_entry.lower():
-            logging.debug("Device: {} is an xpad device, skipping".format(led_entry))
-            return None
+            logging.debug("Device: {} is an xpad (Xbox 360-style) device, adding".format(led_entry))
+            return XpadController
 
         # Xbox One controller
         if "gip" in led_entry:
@@ -325,8 +497,13 @@ class GamepadLEDService:
                     continue
 
                 try:
-                    controller = controller_type(led_path)
+                    if controller_type is XpadController:
+                        controller = controller_type(led_path, self.config.xpad_dark_threshold_lux)
+                    else:
+                        controller = controller_type(led_path, self.config.max_illuminance_lux)
+
                     if controller.is_supported():
+                        controller.start()
                         self.controllers[led_entry] = controller
                         logger.info(f"Connected: {controller_type.__name__} - {led_entry}")
                 except Exception as e:
@@ -337,6 +514,11 @@ class GamepadLEDService:
             for led_entry in removed_devices:
                 controller = self.controllers.pop(led_entry)
                 logger.info(f"Disconnected: {controller.__class__.__name__} - {led_entry}")
+                try:
+                    controller.revert()
+                except Exception as e:
+                    logger.error(f"Error tearing down disconnected controller {led_entry}: {e}")
+
 
     def _update_all_controllers(self):
         """Update LED brightness for all controllers"""
@@ -407,12 +589,31 @@ class GamepadLEDService:
             self.scanner_thread.join(timeout=5)
 
         with self.lock:
-            print(self.controllers)
+            # Revert all controllers in parallel - some (e.g. XpadController)
+            # may block for a while waiting for externally-driven LED state
+            # to settle before restoring the original value, and we don't
+            # want to wait on each of those sequentially.
+            revert_threads = []
             for controller in self.controllers.values():
-                controller.revert()
+                t = threading.Thread(target=self._safe_revert, args=(controller,), daemon=True)
+                t.start()
+                revert_threads.append(t)
+
+            for t in revert_threads:
+                t.join(timeout=XpadController.REVERT_TIMEOUT + 5)
+                if t.is_alive():
+                    logger.warning("A controller took too long to revert; continuing shutdown anyway")
+
             self.controllers.clear()
 
         logger.info("Service stopped")
+
+    def _safe_revert(self, controller: LEDController) -> None:
+        """Revert a single controller, logging (rather than raising) on failure"""
+        try:
+            controller.revert()
+        except Exception as e:
+            logger.error(f"Error reverting {controller.device_name}: {e}")
 
 
 def main():
