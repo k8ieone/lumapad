@@ -19,7 +19,6 @@ from typing import Dict, List, Optional
 import paho.mqtt.client as mqtt
 
 logger = logging.getLogger(__name__)
-service_code: int = 1
 
 # Custom TRACE level, below DEBUG, for very high-frequency/noisy messages
 # (e.g. periodic controller scans, individual sysfs reads/writes) that would
@@ -454,6 +453,7 @@ class GamepadLEDService:
         self.controllers: Dict[str, LEDController] = {}
         self.current_illuminance = 0.0
         self.running = False
+        self.exit_code = 0
         self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self._setup_mqtt()
 
@@ -654,7 +654,7 @@ class GamepadLEDService:
     def stop(self, code: int = 0):
         """Stop the service"""
         logger.info("Stopping Gamepad LED Service")
-        service_code = code
+        self.exit_code = code
         self.running = False
 
         # Stop MQTT
@@ -710,7 +710,7 @@ def main():
     )
     service = GamepadLEDService(config)
     service.run()
-    exit(service_code)
+    exit(service.exit_code)
 
 
 if __name__ == "__main__":
