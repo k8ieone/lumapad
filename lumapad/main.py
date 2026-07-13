@@ -302,7 +302,7 @@ class XpadController(LEDController):
 
     POLL_INTERVAL = 1.0        # Seconds between polls for external changes
     BLINK_INTERVAL = 10.0      # Seconds between heartbeat blinks
-    BLINK_DURATION = 1.0       # Seconds the blink stays "on"
+    BLINK_DURATION = 0.2       # Seconds the blink stays "on"
     REVERT_TIMEOUT = 15.0      # Max seconds to wait for external control to clear on shutdown
 
     def __init__(self, device_path: str, dark_threshold_lux: float = 1.0):
