@@ -291,19 +291,16 @@ class XpadController(LEDController):
     to brightness we blink the LED briefly once in a while as a "still alive"
     heartbeat when the room is dark, and otherwise leave it alone.
 
-    The driver/hardware can also drive this attribute on its own (there's no
-    reliable way to distinguish this from another process writing to it, and
-    sysfs doesn't notify us about it either way) - most notably, we don't
-    want to fight the pad's player-slot indicator. We poll the attribute to
-    detect when its value no longer matches what we last wrote, and back off
-    until it settles back to the value we captured when we started managing
-    the pad.
+    Note: when the pad's battery is low, the driver plays a low-battery
+    blink animation directly in hardware without going through sysfs at
+    all, so we have no way to detect it and there's nothing to "yield" to.
+    Our heartbeat interval is long enough that the low-battery animation
+    still gets to play for a while before we next write to the LED.
     """
 
-    POLL_INTERVAL = 1.0        # Seconds between polls for external changes
+    POLL_INTERVAL = 1.0        # Seconds between heartbeat loop iterations
     BLINK_INTERVAL = 10.0      # Seconds between heartbeat blinks
     BLINK_DURATION = 0.2       # Seconds the blink stays "on"
-    REVERT_TIMEOUT = 15.0      # Max seconds to wait for external control to clear on shutdown
 
     # xpad LED codes 2-5 are "blink N times, then go solid on player slot N"
     # while 6-9 are the solid-only equivalents for the same player slots. We
@@ -320,7 +317,6 @@ class XpadController(LEDController):
         self.initial_brightness: Optional[str] = None
         self._solid_brightness: Optional[str] = None
         self._last_written: Optional[str] = None
-        self._external_override = False
         self._current_illuminance = 0.0
         # We don't know the real illuminance until the first MQTT reading
         # comes in - until then, assume it's NOT dark so we don't blink
@@ -387,31 +383,11 @@ class XpadController(LEDController):
             self._last_written = value
         return ok
 
-    def _check_external_override(self) -> None:
-        """Detect whether something outside of us changed the LED state"""
-        current = self._read_sysfs(self.brightness_path)
-        if current is None:
-            return
-
-        if self._external_override:
-            if current == self.initial_brightness:
-                logger.info(f"Xpad ({self.device_name}) LED returned to baseline, resuming control")
-                self._external_override = False
-                self._last_written = current
-        elif self._last_written is not None and current != self._last_written:
-            logger.info(
-                f"Xpad ({self.device_name}) LED changed externally "
-                f"({self._last_written} -> {current}), yielding control"
-            )
-            self._external_override = True
-            self._last_written = current
-
     def _run(self) -> None:
         """
         Background heartbeat loop: while it's dark, keep the LED off except
         for a brief pulse every BLINK_INTERVAL seconds; once it's bright
         again, restore the pad's normal baseline state and leave it alone.
-        Yields control whenever something else drives the LED.
         """
         logger.debug(f"Starting Xpad heartbeat thread for {self.device_name}")
         if self.initial_brightness is None or self._solid_brightness is None:
@@ -420,76 +396,47 @@ class XpadController(LEDController):
         dark_mode_active = False  # whether we've dimmed the LED for "dark"
 
         while not self._stop_event.is_set():
-            self._check_external_override()
+            with self._state_lock:
+                illuminance = self._current_illuminance
+                have_reading = self._have_illuminance_reading
 
-            if not self._external_override:
-                with self._state_lock:
-                    illuminance = self._current_illuminance
-                    have_reading = self._have_illuminance_reading
+            # Don't treat the room as dark until we've received a real
+            # illuminance reading - otherwise we'd treat the 0.0
+            # placeholder value as "pitch dark" and blink regardless of
+            # actual room light.
+            is_dark = have_reading and illuminance < self.dark_threshold_lux
+            now = time.monotonic()
 
-                # Don't treat the room as dark until we've received a real
-                # illuminance reading - otherwise we'd treat the 0.0
-                # placeholder value as "pitch dark" and blink regardless of
-                # actual room light.
-                is_dark = have_reading and illuminance < self.dark_threshold_lux
-                now = time.monotonic()
-
-                if not is_dark:
-                    # Bright enough - just show the pad's normal LED state
-                    if dark_mode_active or self._last_written != self._solid_brightness:
-                        self._write_value(self._solid_brightness)
-                    dark_mode_active = False
-                elif not dark_mode_active:
-                    # Just went dark - turn the LED off and start the
-                    # heartbeat timer
-                    self._write_value("0")
-                    dark_mode_active = True
-                    last_blink = now
-                elif (now - last_blink) >= self.BLINK_INTERVAL:
-                    logger.debug(f"Blinking Xpad ({self.device_name})")
+            if not is_dark:
+                # Bright enough - just show the pad's normal LED state
+                if dark_mode_active or self._last_written != self._solid_brightness:
                     self._write_value(self._solid_brightness)
-                    self._stop_event.wait(self.BLINK_DURATION)
-
-                    # Recheck: don't stomp on an external change that may
-                    # have happened while the blink was on
-                    self._check_external_override()
-                    if not self._external_override:
-                        self._write_value("0")
-
-                    last_blink = now
+                dark_mode_active = False
+            elif not dark_mode_active:
+                # Just went dark - turn the LED off and start the
+                # heartbeat timer
+                self._write_value("0")
+                dark_mode_active = True
+                last_blink = now
+            elif (now - last_blink) >= self.BLINK_INTERVAL:
+                logger.debug(f"Blinking Xpad ({self.device_name})")
+                self._write_value(self._solid_brightness)
+                self._stop_event.wait(self.BLINK_DURATION)
+                self._write_value("0")
+                last_blink = now
 
             self._stop_event.wait(self.POLL_INTERVAL)
 
         logger.debug(f"Stopping Xpad heartbeat thread for {self.device_name}")
 
     def revert(self) -> None:
-        """
-        Restore the pad's original LED state, waiting (up to a timeout) for
-        any externally-driven state to settle back to baseline first.
-        """
+        """Restore the pad's original LED state"""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=self.POLL_INTERVAL * 2)
 
         if self.initial_brightness is None:
             return
-
-        if self._external_override:
-            logger.info(
-                f"Xpad ({self.device_name}) LED is externally controlled, "
-                f"waiting up to {self.REVERT_TIMEOUT:.0f}s for it to settle"
-            )
-            deadline = time.monotonic() + self.REVERT_TIMEOUT
-            while time.monotonic() < deadline:
-                current = self._read_sysfs(self.brightness_path)
-                if current == self.initial_brightness:
-                    self._external_override = False
-                    break
-                time.sleep(self.POLL_INTERVAL)
-            else:
-                logger.warning(
-                    f"Timed out waiting for Xpad ({self.device_name}) LED to settle; reverting anyway"
-                )
 
         logger.info(f"Setting Xpad ({self.device_name}) brightness back to {self.initial_brightness}")
         self._write_sysfs(self.brightness_path, self.initial_brightness)
@@ -761,10 +708,8 @@ class GamepadLEDService:
             self.scanner_thread.join(timeout=5)
 
         with self.lock:
-            # Revert all controllers in parallel - some (e.g. XpadController)
-            # may block for a while waiting for externally-driven LED state
-            # to settle before restoring the original value, and we don't
-            # want to wait on each of those sequentially.
+            # Revert all controllers in parallel so a slow one doesn't block
+            # the others.
             logger.debug(f"Reverting {len(self.controllers)} controller(s)")
             revert_threads = []
             for controller in self.controllers.values():
@@ -773,7 +718,7 @@ class GamepadLEDService:
                 revert_threads.append(t)
 
             for t in revert_threads:
-                t.join(timeout=XpadController.REVERT_TIMEOUT + 5)
+                t.join(timeout=5)
                 if t.is_alive():
                     logger.warning("A controller took too long to revert; continuing shutdown anyway")
 
